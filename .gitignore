@@ -1,0 +1,18 @@
+# --- File Rahasia (JANGAN DIHAPUS DARI LIST INI) ---
+token.json
+client_secret.json
+credentials.json
+.env
+
+# --- Folder Sampah/Otomatis ---
+__pycache__/
+*.pyc
+node_modules/
+venv/
+.DS_Store
+
+# --- Folder Download Sementara ---
+temp_downloads/
+
+# --- Sesi WhatsApp (PENTING BIAR WA GAK DIBAJAK) ---
+wa-engine/auth_session/
