@@ -1,316 +1,763 @@
-from flask import Flask, request, jsonify
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
-from apscheduler.schedulers.background import BackgroundScheduler
-from duckduckgo_search import DDGS
-import requests
 import json
+import logging
 import os
 import re
-import ast
+import threading
+import uuid
+from datetime import datetime, timedelta, timezone
+from json import JSONDecodeError
 
-# ================= K O N F I G U R A S I =================
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+from duckduckgo_search import DDGS
+from flask import Flask, jsonify, request
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ================= KONFIGURASI =================
 
 load_dotenv()
-BLACKBOX_API_URL = os.getenv("BLACKBOX_API_URL")
-BLACKBOX_API_KEY = os.getenv("BLACKBOX_API_KEY")
-PARENT_FOLDER_ID = os.getenv("PARENT_FOLDER_ID") # Pastikan ID di .env sudah benar!
-ID_KALENDER_KAMU = os.getenv("ID_KALENDER_KAMU")
-DB_FILE = 'jadwal_meeting.json'
+
+BLACKBOX_API_URL = os.getenv("BLACKBOX_API_URL", "").strip()
+BLACKBOX_API_KEY = os.getenv("BLACKBOX_API_KEY", "").strip()
+PARENT_FOLDER_ID = os.getenv("PARENT_FOLDER_ID", "").strip()
+ID_KALENDER_KAMU = os.getenv("ID_KALENDER_KAMU", "primary").strip()
+DB_FILE = "jadwal_meeting.json"
 
 BOT_TRIGGERS = [
-    "hunky", "@hunky", "bot", "ai", 
-    "@628816883610", "@262779135115377", 
-    "tolong", "catat", "cari", "simpan", "ingatkan", "jadwal", "meeting"
+    "hunky",
+    "@hunky",
+    "bot",
+    "ai",
+    "@628816883610",
+    "@262779135115377",
+    "tolong",
+    "catat",
+    "cari",
+    "simpan",
+    "ingatkan",
+    "jadwal",
+    "meeting",
 ]
 
-SCOPES = ['https://www.googleapis.com/auth/calendar', 'https://www.googleapis.com/auth/drive']
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive",
+]
+
+MEETING_RETENTION_DAYS = int(os.getenv("MEETING_RETENTION_DAYS", "30"))
+WEB_SEARCH_MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "3"))
+BLACKBOX_TIMEOUT_SECONDS = float(os.getenv("BLACKBOX_TIMEOUT_SECONDS", "20"))
+REMINDER_TIMEOUT_SECONDS = float(os.getenv("REMINDER_TIMEOUT_SECONDS", "8"))
+WA_PUSH_URL = os.getenv("WA_PUSH_URL", "http://127.0.0.1:3000/send-message")
+
+FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() in {"1", "true", "yes", "on"}
+
+ACTION_SAVE_MEETING = "save_meeting"
+ACTION_SEARCH_MEETING = "search_meeting"
+ACTION_SEARCH_FILE = "search_file"
+ACTION_WEB_SEARCH = "web_search"
+ACTION_RESET_SCHEDULE = "reset_schedule"
+
+ALLOWED_ACTIONS = {
+    ACTION_SAVE_MEETING,
+    ACTION_SEARCH_MEETING,
+    ACTION_SEARCH_FILE,
+    ACTION_WEB_SEARCH,
+    ACTION_RESET_SCHEDULE,
+}
+
+REQUIRED_ENV_VARS = ["BLACKBOX_API_URL", "BLACKBOX_API_KEY", "PARENT_FOLDER_ID"]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s [corr_id=%(corr_id)s] %(message)s",
+)
+logger = logging.getLogger("hunky")
+
+
+class DefaultCorrelationFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, "corr_id"):
+            record.corr_id = "-"
+        return True
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(DefaultCorrelationFilter())
 
 app = Flask(__name__)
+_scheduler = BackgroundScheduler()
+_scheduler_started = False
 
-# ================= F U N G S I   H E L P E R =================
 
-def get_google_service(service_name, version):
-    creds = None
-    try:
-        if os.path.exists('token.json'):
-            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else: return None
-        return build(service_name, version, credentials=creds)
-    except: return None
+class CorrelationAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        extra = kwargs.get("extra", {})
+        extra.setdefault("corr_id", self.extra.get("corr_id", "-"))
+        kwargs["extra"] = extra
+        return msg, kwargs
+
+
+def get_logger(corr_id="-"):
+    return CorrelationAdapter(logger, {"corr_id": corr_id})
+
+
+def validate_required_env():
+    missing = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
+    if missing:
+        missing_joined = ", ".join(missing)
+        raise RuntimeError(f"Missing required env vars: {missing_joined}")
+
+
+def create_retry_session():
+    retry = Retry(
+        total=2,
+        connect=2,
+        read=2,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"]),
+    )
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+HTTP = create_retry_session()
+
+
+class MeetingRepository:
+    def __init__(self, db_path, retention_days=30):
+        self.db_path = db_path
+        self.retention_days = retention_days
+        self._lock = threading.RLock()
+        self._ensure_file()
+
+    def _ensure_file(self):
+        if not os.path.exists(self.db_path):
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+
+    def _read_raw(self):
+        self._ensure_file()
+        with open(self.db_path, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+            except JSONDecodeError:
+                return []
+
+    def _write_raw(self, items):
+        with open(self.db_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2, ensure_ascii=False)
+
+    def _normalize_item(self, raw_item):
+        if not isinstance(raw_item, dict):
+            return None
+
+        mapped = {
+            "group_id": raw_item.get("group_id") or raw_item.get("GroupId") or "",
+            "date": raw_item.get("date") or raw_item.get("Date") or "",
+            "time": raw_item.get("time") or raw_item.get("Time") or "",
+            "topic": raw_item.get("topic") or raw_item.get("Topic") or "",
+            "location": raw_item.get("location") or raw_item.get("Location") or "-",
+            "link": raw_item.get("link") or raw_item.get("Link") or "",
+            "people_to_meet": raw_item.get("people_to_meet")
+            or raw_item.get("People to Meet")
+            or "",
+            "pic_partner": raw_item.get("pic_partner") or raw_item.get("PIC Partner") or "",
+            "reminded": bool(raw_item.get("reminded", False)),
+        }
+
+        if not mapped["group_id"] or not mapped["date"] or not mapped["time"]:
+            return None
+
+        return mapped
+
+    def _to_legacy_shape(self, item):
+        return {
+            "Date": item["date"],
+            "Time": item["time"],
+            "People to Meet": item.get("people_to_meet", ""),
+            "PIC Partner": item.get("pic_partner", ""),
+            "Topic": item.get("topic", ""),
+            "Location": item.get("location", "-"),
+            "Link": item.get("link", ""),
+            "GroupId": item["group_id"],
+            "reminded": item.get("reminded", False),
+            "group_id": item["group_id"],
+            "date": item["date"],
+            "time": item["time"],
+            "topic": item.get("topic", ""),
+            "location": item.get("location", "-"),
+            "link": item.get("link", ""),
+            "people_to_meet": item.get("people_to_meet", ""),
+            "pic_partner": item.get("pic_partner", ""),
+        }
+
+    def _safe_datetime(self, date_str, time_str):
+        try:
+            return datetime.strptime(f"{date_str} {time_str.replace('.', ':')}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            return None
+
+    def _purge_expired(self, items):
+        cutoff = datetime.now().date() - timedelta(days=self.retention_days)
+        fresh_items = []
+        purged_count = 0
+        for item in items:
+            dt = self._safe_datetime(item["date"], item["time"])
+            if dt and dt.date() < cutoff:
+                purged_count += 1
+                continue
+            fresh_items.append(item)
+        return fresh_items, purged_count
+
+    def _normalize_and_sort(self, raw_items):
+        normalized = []
+        for raw_item in raw_items:
+            item = self._normalize_item(raw_item)
+            if item:
+                normalized.append(item)
+
+        normalized.sort(key=lambda x: (x["group_id"], x["date"], x["time"], x.get("topic", "")))
+        return normalized
+
+    def load_all(self):
+        with self._lock:
+            normalized = self._normalize_and_sort(self._read_raw())
+            purged, purged_count = self._purge_expired(normalized)
+            if purged_count > 0 or purged != normalized:
+                self._write_raw([self._to_legacy_shape(item) for item in purged])
+            return purged
+
+    def save_all(self, canonical_items):
+        with self._lock:
+            normalized = self._normalize_and_sort(canonical_items)
+            purged, _ = self._purge_expired(normalized)
+            self._write_raw([self._to_legacy_shape(item) for item in purged])
+
+    def add(self, canonical_item):
+        with self._lock:
+            items = self.load_all()
+            items.append(canonical_item)
+            self.save_all(items)
+
+    def list_by_group(self, group_id):
+        return [x for x in self.load_all() if x["group_id"] == group_id]
+
+    def reset_group(self, group_id):
+        items = [x for x in self.load_all() if x["group_id"] != group_id]
+        self.save_all(items)
+
+
+meeting_repo = MeetingRepository(DB_FILE, MEETING_RETENTION_DAYS)
+
+
+# ================= HELPER =================
 
 def format_tanggal_indo(tgl_str):
     try:
         dt = datetime.strptime(tgl_str, "%Y-%m-%d")
         days = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
-        months = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+        months = [
+            "",
+            "Januari",
+            "Februari",
+            "Maret",
+            "April",
+            "Mei",
+            "Juni",
+            "Juli",
+            "Agustus",
+            "September",
+            "Oktober",
+            "November",
+            "Desember",
+        ]
         return f"{days[dt.weekday()]}, {dt.day} {months[dt.month]} {dt.year}"
-    except: return tgl_str
+    except ValueError:
+        return tgl_str
 
-# --- FITUR 1: WEB SEARCH ---
-def cari_di_internet(query):
-    print(f"🌍 Searching: {query}...")
+
+def now_wib_naive():
+    return (datetime.now(timezone.utc) + timedelta(hours=7)).replace(tzinfo=None)
+
+
+def is_valid_date(date_str):
     try:
-        results = DDGS().text(query, max_results=3)
-        if not results: return "Tidak ada info terkini."
+        datetime.strptime(date_str, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def is_valid_time(time_str):
+    try:
+        datetime.strptime(time_str.replace(".", ":"), "%H:%M")
+        return True
+    except ValueError:
+        return False
+
+
+def sanitize_drive_keyword(keyword):
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", str(keyword or "")).strip()
+    return cleaned.replace("'", "\\'")[:100]
+
+
+def get_google_service(service_name, version, corr_id="-"):
+    log = get_logger(corr_id)
+    creds = None
+    try:
+        if os.path.exists("token.json"):
+            creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                log.warning("Google token missing or invalid")
+                return None
+        return build(service_name, version, credentials=creds)
+    except Exception as exc:
+        log.exception("Failed to create Google service: %s", exc)
+        return None
+
+
+def cari_di_internet(query, corr_id="-"):
+    log = get_logger(corr_id)
+    log.info("Searching web: %s", query)
+    try:
+        results = DDGS().text(query, max_results=WEB_SEARCH_MAX_RESULTS)
+        if not results:
+            return "Tidak ada info terkini."
         summary = ""
         for res in results:
-            summary += f"- {res['title']}: {res['body']}\n"
-        return summary
-    except Exception as e: return f"Gagal searching: {e}"
+            summary += f"- {res.get('title', '-')}: {res.get('body', '-') }\n"
+        return summary.strip()
+    except Exception as exc:
+        log.exception("Web search failed: %s", exc)
+        return f"Gagal searching: {exc}"
 
-# --- FITUR 2: UPLOAD DRIVE (RESTRICTED TO FOLDER) ---
-def upload_ke_drive(file_path, mime_type, custom_name=None):
-    service = get_google_service('drive', 'v3')
-    if not service: return "❌ Gagal koneksi Drive."
+
+def upload_ke_drive(file_path, mime_type, custom_name=None, corr_id="-"):
+    log = get_logger(corr_id)
+    service = get_google_service("drive", "v3", corr_id=corr_id)
+    if not service:
+        return "❌ Gagal koneksi Drive."
+
     try:
         final_name = os.path.basename(file_path)
         if custom_name:
-            clean_name = "".join([c for c in custom_name if c.isalnum() or c in (' ', '-', '_')]).strip()
+            clean_name = "".join([c for c in custom_name if c.isalnum() or c in (" ", "-", "_")]).strip()
             ext = os.path.splitext(file_path)[1]
-            if not clean_name.endswith(ext): clean_name += ext
-            final_name = clean_name
+            if clean_name and not clean_name.endswith(ext):
+                clean_name += ext
+            if clean_name:
+                final_name = clean_name
 
-        # Upload Spesifik ke PARENT_FOLDER_ID
-        file_metadata = {'name': final_name, 'parents': [PARENT_FOLDER_ID]}
+        file_metadata = {"name": final_name, "parents": [PARENT_FOLDER_ID]}
         media = MediaFileUpload(file_path, mimetype=mime_type)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        
-        if os.path.exists(file_path): os.remove(file_path)
+        file = (
+            service.files()
+            .create(body=file_metadata, media_body=media, fields="id, webViewLink")
+            .execute(num_retries=2)
+        )
         return f"✅ **File Disimpan!**\n📂 {final_name}\n🔗 {file.get('webViewLink')}"
-    except Exception as e: return f"❌ Gagal upload: {e}"
+    except Exception as exc:
+        log.exception("Drive upload failed: %s", exc)
+        return f"❌ Gagal upload: {exc}"
+    finally:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError as exc:
+                log.warning("Failed cleanup temp file %s: %s", file_path, exc)
 
-# --- FITUR 3: CARI FILE (RESTRICTED TO FOLDER) ---
-def cari_file_di_drive(keyword):
-    service = get_google_service('drive', 'v3')
-    if not service: return "❌ Gagal koneksi Drive."
+
+def cari_file_di_drive(keyword, corr_id="-"):
+    log = get_logger(corr_id)
+    service = get_google_service("drive", "v3", corr_id=corr_id)
+    if not service:
+        return "❌ Gagal koneksi Drive."
+
+    safe_keyword = sanitize_drive_keyword(keyword)
+    if not safe_keyword:
+        return "⚠️ Keyword file tidak valid."
+
     try:
-        # QUERY DIPERKETAT: Hanya cari di dalam folder PARENT_FOLDER_ID
-        query = f"name contains '{keyword}' and '{PARENT_FOLDER_ID}' in parents and trashed = false"
-        
-        results = service.files().list(q=query, pageSize=5, fields="files(name, webViewLink)", orderBy="createdTime desc").execute()
-        items = results.get('files', [])
-        
-        if not items: return f"⚠️ File *'{keyword}'* tidak ditemukan di dalam Folder Kerja Hunky."
-        
-        balasan = f"📂 **Hasil Pencarian '{keyword}':**\n"
+        query = f"name contains '{safe_keyword}' and '{PARENT_FOLDER_ID}' in parents and trashed = false"
+        results = (
+            service.files()
+            .list(
+                q=query,
+                pageSize=5,
+                fields="files(name, webViewLink)",
+                orderBy="createdTime desc",
+            )
+            .execute(num_retries=2)
+        )
+        items = results.get("files", [])
+
+        if not items:
+            return f"⚠️ File *'{safe_keyword}'* tidak ditemukan di dalam Folder Kerja Hunky."
+
+        balasan = f"📂 **Hasil Pencarian '{safe_keyword}':**\n"
         for item in items:
-            balasan += f"\n📄 {item['name']}\n🔗 {item['webViewLink']}\n"
+            balasan += f"\n📄 {item.get('name', '-')}\n🔗 {item.get('webViewLink', '-')}\n"
         return balasan
-    except Exception as e: return f"❌ Error cari file: {e}"
+    except Exception as exc:
+        log.exception("Drive search failed: %s", exc)
+        return f"❌ Error cari file: {exc}"
 
-def kelola_database_jadwal(aksi, data_baru=None):
-    if not os.path.exists(DB_FILE):
-        with open(DB_FILE, 'w') as f: json.dump([], f)
-    with open(DB_FILE, 'r') as f:
-        try: jadwal_list = json.load(f)
-        except: jadwal_list = []
 
-    if aksi == "tambah" and data_baru:
-        jadwal_list.append(data_baru)
-        jadwal_list.sort(key=lambda x: (x.get('Date', '9999-12-31'), x.get('Time', '23:59')))
-        with open(DB_FILE, 'w') as f: json.dump(jadwal_list, f, indent=4)
-        return jadwal_list
-    elif aksi == "lihat":
-        jadwal_list.sort(key=lambda x: (x.get('Date', '9999-12-31'), x.get('Time', '23:59')))
-        return jadwal_list
-    elif aksi == "reset":
-        with open(DB_FILE, 'w') as f: json.dump([], f)
-        return []
+def build_ai_system_instruction(group_id, konteks_tambahan=""):
+    waktu_sekarang = now_wib_naive().strftime("%A, %Y-%m-%d Jam %H:%M WIB")
+    jadwal_str = json.dumps(meeting_repo.list_by_group(group_id), indent=2, ensure_ascii=False)
+    return f"""
+Kamu adalah HUNKY, asisten AI.
+INFO: Waktu {waktu_sekarang}.
+GROUP_ID: {group_id}
+DATABASE MEETING GROUP: {jadwal_str}
+KONTEKS TAMBAHAN: {konteks_tambahan}
 
-# ================= S C H E D U L E R =================
+ATURAN:
+1. Jika ingin menjalankan aksi, output HARUS JSON valid object tunggal.
+2. Gunakan hanya action ini: save_meeting, search_file, web_search, search_meeting, reset_schedule.
+3. save_meeting.data wajib punya date(YYYY-MM-DD), time(HH:MM), topic, location, link.
+4. Jika bukan aksi, jawab teks biasa.
+""".strip()
 
-def cek_reminder_otomatis():
-    waktu_sekarang = datetime.now(timezone.utc) + timedelta(hours=7)
-    jadwal_list = kelola_database_jadwal("lihat")
-    updated_list = []
-    perlu_simpan = False
 
-    for item in jadwal_list:
-        if item.get('reminded', False):
-            updated_list.append(item)
-            continue
-        try:
-            tgl = item.get('Date')
-            jam = item.get('Time')
-            if not tgl or not jam: 
-                updated_list.append(item)
-                continue
-            jam = jam.replace('.', ':')
-            waktu_meeting = datetime.strptime(f"{tgl} {jam}", "%Y-%m-%d %H:%M")
-            selisih = waktu_meeting - waktu_sekarang.replace(tzinfo=None)
-            menit_sisa = selisih.total_seconds() / 60
-
-            if 0 < menit_sisa <= 5:
-                print(f"\n🔔 REMINDER: {item.get('Topic')}")
-                target = item.get('GroupId')
-                if target:
-                    pesan = f"⏰ *REMINDER MEETING {int(menit_sisa)} MENIT LAGI!*\n📝 {item.get('Topic')}\n🔗 {item.get('Link')}"
-                    try: requests.post("http://127.0.0.1:3000/send-message", json={"target_id": target, "message": pesan})
-                    except: pass
-                item['reminded'] = True
-                perlu_simpan = True
-        except: pass
-        updated_list.append(item)
-
-    if perlu_simpan:
-        with open(DB_FILE, 'w') as f: json.dump(updated_list, f, indent=4)
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=cek_reminder_otomatis, trigger="interval", minutes=1)
-scheduler.start()
-
-# ================= O T A K   A I =================
-
-def tanya_blackbox(pesan_user, konteks_tambahan=""):
-    waktu_sekarang = datetime.now(timezone.utc) + timedelta(hours=7)
-    info_waktu = waktu_sekarang.strftime("%A, %Y-%m-%d Jam %H:%M WIB")
-    
-    jadwal_str = json.dumps(kelola_database_jadwal("lihat"), indent=2)
-
-    system_instruction = f"""
-    Kamu adalah HUNKY, asisten AI.
-    INFO: Waktu {info_waktu}.
-    DATABASE MEETING: {jadwal_str}
-    KONTEKS TAMBAHAN: {konteks_tambahan}
-    
-    ATURAN: JSON DOUBLE QUOTES UNTUK AKSI.
-    TUGAS:
-    1. NOTE MEETING -> JSON {{"action": "save_meeting", "data": {{...}}}}
-    2. CARI FILE -> JSON {{"action": "search_file", "keyword": "..."}}
-    3. CARI INTERNET -> JSON {{"action": "web_search", "keyword": "..."}}
-    4. LIHAT JADWAL -> JSON {{"action": "search_meeting", "date": "YYYY-MM-DD"}}
-    5. CHAT BIASA -> Teks biasa.
-    """
+def tanya_blackbox(pesan_user, group_id, konteks_tambahan="", corr_id="-"):
+    log = get_logger(corr_id)
+    system_instruction = build_ai_system_instruction(group_id, konteks_tambahan)
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {BLACKBOX_API_KEY}"
+        "Authorization": f"Bearer {BLACKBOX_API_KEY}",
     }
-    
-    # Model yang sudah kamu konfirmasi valid
-    MODEL_VALID = "blackboxai/deepseek/deepseek-chat-v3.1" 
-
     payload = {
         "messages": [
             {"role": "system", "content": system_instruction},
-            {"role": "user", "content": pesan_user}
+            {"role": "user", "content": pesan_user},
         ],
-        "model": MODEL_VALID, 
-        "clickedAnswer2": False, 
-        "clickedAnswer3": False
+        "model": "blackboxai/deepseek/deepseek-chat-v3.1",
+        "clickedAnswer2": False,
+        "clickedAnswer3": False,
     }
 
     try:
-        response = requests.post(BLACKBOX_API_URL, headers=headers, json=payload)
-        if response.status_code == 200:
-            hasil = response.json()
-            return hasil.get('choices', [{}])[0].get('message', {}).get('content', '') or hasil.get('response', '') or str(hasil)
-        return f"Error API Blackbox: {response.status_code} - {response.text}"
-    except Exception as e: return f"Error Koneksi: {e}"
+        response = HTTP.post(BLACKBOX_API_URL, headers=headers, json=payload, timeout=BLACKBOX_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            return f"Error API Blackbox: {response.status_code} - {response.text}"
 
-# ================= R O U T E   U T A M A =================
+        hasil = response.json()
+        return (
+            hasil.get("choices", [{}])[0].get("message", {}).get("content", "")
+            or hasil.get("response", "")
+            or str(hasil)
+        )
+    except Exception as exc:
+        log.exception("Blackbox request failed: %s", exc)
+        return f"Error Koneksi: {exc}"
+
+
+def extract_first_json_object(text):
+    if not text:
+        return None
+
+    fenced = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    candidates = fenced + [text]
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        for idx, ch in enumerate(candidate):
+            if ch != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate[idx:])
+                if isinstance(parsed, dict):
+                    return parsed
+            except JSONDecodeError:
+                continue
+    return None
+
+
+def validate_action_payload(data_json, sender):
+    if not isinstance(data_json, dict):
+        return False, "Payload aksi harus object JSON."
+
+    action = data_json.get("action")
+    if action not in ALLOWED_ACTIONS:
+        return False, f"Action tidak dikenali: {action}"
+
+    if action == ACTION_SAVE_MEETING:
+        meeting_data = data_json.get("data")
+        if not isinstance(meeting_data, dict):
+            return False, "save_meeting.data harus object."
+
+        date_value = str(meeting_data.get("date") or meeting_data.get("Date") or "").strip()
+        time_value = str(meeting_data.get("time") or meeting_data.get("Time") or "").strip().replace(".", ":")
+        topic_value = str(meeting_data.get("topic") or meeting_data.get("Topic") or "").strip()
+
+        if not is_valid_date(date_value):
+            return False, "Format date harus YYYY-MM-DD."
+        if not is_valid_time(time_value):
+            return False, "Format time harus HH:MM."
+        if not topic_value:
+            return False, "Field topic wajib diisi."
+        if not sender:
+            return False, "group_id/sender wajib ada."
+
+    if action == ACTION_SEARCH_MEETING:
+        date_value = str(data_json.get("date") or "").strip()
+        if not is_valid_date(date_value):
+            return False, "search_meeting.date harus YYYY-MM-DD."
+
+    if action in {ACTION_SEARCH_FILE, ACTION_WEB_SEARCH}:
+        key_name = "keyword"
+        val = str(data_json.get(key_name) or "").strip()
+        if not val:
+            return False, f"{action}.keyword wajib diisi."
+
+    return True, "ok"
+
+
+def is_triggered_message(sender, message):
+    is_group = sender.endswith("@g.us")
+    if not is_group:
+        return True
+    lowered = (message or "").lower()
+    return any(trigger.lower() in lowered for trigger in BOT_TRIGGERS)
+
+
+def format_group_schedule(items):
+    if not items:
+        return "📅 Belum ada jadwal meeting untuk grup ini."
+
+    balasan = "✅ **Jadwal Meeting Tersimpan!**\n\n**Jadwal Meeting Grup**"
+    current_date = ""
+    for item in items:
+        item_date = item.get("date", "-")
+        if item_date != current_date:
+            balasan += f"\n\n**{format_tanggal_indo(item_date)}**\n"
+            current_date = item_date
+        balasan += f"\nTime : {item.get('time', '-')} WIB"
+        balasan += f"\nTopic : {item.get('topic', '-')}"
+        balasan += f"\nTempat : {item.get('location', '-')}"
+        balasan += f"\nLink : {item.get('link', '-')}\n"
+    return balasan
+
+
+def send_reminder_message(group_id, message, corr_id="scheduler"):
+    log = get_logger(corr_id)
+    try:
+        response = HTTP.post(
+            WA_PUSH_URL,
+            json={"target_id": group_id, "message": message},
+            timeout=REMINDER_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 300:
+            log.warning("WA push failed status=%s body=%s", response.status_code, response.text)
+    except Exception as exc:
+        log.exception("WA push request failed: %s", exc)
+
+
+def cek_reminder_otomatis():
+    log = get_logger("scheduler")
+    now = now_wib_naive()
+    meetings = meeting_repo.load_all()
+    changed = False
+
+    for item in meetings:
+        if item.get("reminded", False):
+            continue
+        meeting_dt = meeting_repo._safe_datetime(item.get("date", ""), item.get("time", ""))
+        if not meeting_dt:
+            continue
+
+        diff_minutes = (meeting_dt - now).total_seconds() / 60
+        if 0 < diff_minutes <= 5:
+            group_id = item.get("group_id")
+            if group_id:
+                pesan = (
+                    f"⏰ *REMINDER MEETING {int(diff_minutes)} MENIT LAGI!*\n"
+                    f"📝 {item.get('topic', '-')}\n"
+                    f"🔗 {item.get('link', '-') }"
+                )
+                send_reminder_message(group_id, pesan)
+                log.info("Reminder sent for group=%s topic=%s", group_id, item.get("topic", "-"))
+            item["reminded"] = True
+            changed = True
+
+    if changed:
+        meeting_repo.save_all(meetings)
+
+
+def start_scheduler():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler.add_job(func=cek_reminder_otomatis, trigger="interval", minutes=1)
+    _scheduler.start()
+    _scheduler_started = True
+
+
+def execute_action(data_json, sender, original_message, corr_id="-"):
+    action = data_json.get("action")
+
+    if action == ACTION_SAVE_MEETING:
+        meeting_data = data_json.get("data", {})
+        new_item = {
+            "group_id": sender,
+            "date": str(meeting_data.get("date") or meeting_data.get("Date")).strip(),
+            "time": str(meeting_data.get("time") or meeting_data.get("Time")).strip().replace(".", ":"),
+            "topic": str(meeting_data.get("topic") or meeting_data.get("Topic") or "").strip(),
+            "location": str(meeting_data.get("location") or meeting_data.get("Location") or "-").strip(),
+            "link": str(meeting_data.get("link") or meeting_data.get("Link") or "").strip(),
+            "people_to_meet": str(
+                meeting_data.get("people_to_meet") or meeting_data.get("People to Meet") or ""
+            ).strip(),
+            "pic_partner": str(meeting_data.get("pic_partner") or meeting_data.get("PIC Partner") or "").strip(),
+            "reminded": False,
+        }
+        meeting_repo.add(new_item)
+        return format_group_schedule(meeting_repo.list_by_group(sender))
+
+    if action == ACTION_SEARCH_MEETING:
+        target_date = data_json.get("date")
+        group_items = meeting_repo.list_by_group(sender)
+        result = [m for m in group_items if m.get("date") == target_date]
+        if not result:
+            return f"📅 Tidak ada jadwal meeting pada **{format_tanggal_indo(target_date)}**."
+
+        balasan = f"📅 **Jadwal Meeting: {format_tanggal_indo(target_date)}**\n"
+        for item in result:
+            balasan += f"\n🕒 {item.get('time', '-')} WIB"
+            balasan += f"\n📝 {item.get('topic', '-')}"
+            balasan += f"\n📍 {item.get('location', '-')}"
+            balasan += f"\n🔗 {item.get('link', '-')}\n"
+        return balasan
+
+    if action == ACTION_SEARCH_FILE:
+        return cari_file_di_drive(data_json.get("keyword"), corr_id=corr_id)
+
+    if action == ACTION_WEB_SEARCH:
+        keyword = data_json.get("keyword")
+        hasil_cari = cari_di_internet(keyword, corr_id=corr_id)
+        return tanya_blackbox(
+            f"User tanya: {original_message}",
+            group_id=sender,
+            konteks_tambahan=f"Fakta Internet: {hasil_cari}",
+            corr_id=corr_id,
+        )
+
+    if action == ACTION_RESET_SCHEDULE:
+        meeting_repo.reset_group(sender)
+        return "🗑️ Jadwal meeting grup ini telah direset."
+
+    return "Aksi tidak dikenali."
+
+
+# ================= ROUTES =================
+
+@app.route("/health", methods=["GET"])
+def health():
+    db_ok = True
+    db_msg = "ok"
+    try:
+        meeting_repo.load_all()
+    except Exception as exc:
+        db_ok = False
+        db_msg = str(exc)
+
+    google_ok = get_google_service("drive", "v3") is not None
+    blackbox_ok = bool(BLACKBOX_API_URL and BLACKBOX_API_KEY)
+    scheduler_ok = _scheduler_started and _scheduler.running
+
+    payload = {
+        "status": "ok" if all([db_ok, google_ok, blackbox_ok, scheduler_ok]) else "degraded",
+        "blackbox": "ok" if blackbox_ok else "missing_config",
+        "google_drive": "ok" if google_ok else "unavailable",
+        "db": "ok" if db_ok else f"error: {db_msg}",
+        "scheduler": "running" if scheduler_ok else "stopped",
+        "calendar_id": ID_KALENDER_KAMU,
+    }
+    code = 200 if payload["status"] == "ok" else 503
+    return jsonify(payload), code
+
 
 @app.route("/chat", methods=["POST"])
 def chat():
-    data = request.json
-    sender = data.get('sender')
-    message = data.get('message') or ""
-    file_path = data.get('file_path')
-    mime_type = data.get('mime_type')
-    
-    print(f"\n📩 Pesan: {message} | Sender: {sender} | File: {file_path}")
+    data = request.get_json(silent=True) or {}
 
-    is_group = "@g.us" in sender
-    is_triggered = not is_group
-    if is_group:
-        for t in BOT_TRIGGERS:
-            if t.lower() in message.lower():
-                is_triggered = True; break
-    
-    # LOGIKA FILE
+    sender = str(data.get("sender") or "").strip()
+    message = str(data.get("message") or "")
+    file_path = data.get("file_path")
+    mime_type = data.get("mime_type")
+    message_id = str(data.get("message_id") or uuid.uuid4().hex[:12])
+    log = get_logger(message_id)
+
+    if not sender:
+        return jsonify({"error_code": "BAD_REQUEST", "error": "sender wajib diisi"}), 400
+
+    log.info("Incoming chat sender=%s has_file=%s", sender, bool(file_path))
+
+    triggered = is_triggered_message(sender, message)
+
     if file_path:
+        if not os.path.exists(file_path):
+            return jsonify(
+                {"error_code": "FILE_NOT_FOUND", "error": "file_path tidak ditemukan di server"}
+            ), 400
+
         msg_lower = message.lower()
-        keyword_simpan = any(w in msg_lower for w in ["simpan", "upload", "taruh"])
-        
-        if is_triggered and keyword_simpan:
-            nama_file = message.replace("@hunky","").replace("simpan","").strip() or "File Upload"
-            balasan = upload_ke_drive(file_path, mime_type, custom_name=nama_file)
+        keyword_simpan = any(word in msg_lower for word in ["simpan", "upload", "taruh"])
+
+        if triggered and keyword_simpan:
+            nama_file = message.replace("@hunky", "").replace("simpan", "").strip() or "File Upload"
+            balasan = upload_ke_drive(file_path, mime_type, custom_name=nama_file, corr_id=message_id)
             return jsonify({"reply": balasan})
-        else:
-            if os.path.exists(file_path): os.remove(file_path)
-            return jsonify({"status": "ignored_file"})
 
-    # LOGIKA TEXT
-    if not is_triggered: return jsonify({"status": "ignored_text"})
-
-    konteks_internet = "" 
-    jawaban_ai = tanya_blackbox(message, konteks_internet)
-    balasan_final = jawaban_ai 
-    
-    match = re.search(r'\{.*\}', jawaban_ai, re.DOTALL)
-    if match:
         try:
-            json_str = match.group(0)
-            data_json = json.loads(json_str)
-            action = data_json.get('action')
-            
-            if action == 'save_meeting':
-                meeting_data = data_json.get('data')
-                meeting_data['GroupId'] = sender
-                meeting_data['reminded'] = False
-                kelola_database_jadwal("tambah", meeting_data)
-                
-                jadwal_terbaru = kelola_database_jadwal("lihat")
-                balasan_final = "✅ **Jadwal Meeting Tersimpan!**\n\n**Jadwal Meeting**"
-                current_date = ""
-                for item in jadwal_terbaru:
-                    item_date = item.get('Date', '-')
-                    if item_date != current_date:
-                        balasan_final += f"\n\n**{format_tanggal_indo(item_date)}**\n"
-                        current_date = item_date
-                    balasan_final += f"\nTime : {item.get('Time')} WIB"
-                    balasan_final += f"\nTopic : {item.get('Topic')}"
-                    balasan_final += f"\nTempat : {item.get('Location')}"
-                    balasan_final += f"\nLink : {item.get('Link')}\n"
+            os.remove(file_path)
+        except OSError as exc:
+            log.warning("Unable to delete ignored temp file %s: %s", file_path, exc)
+        return jsonify({"status": "ignored_file"})
 
-            elif action == 'search_meeting':
-                target_date = data_json.get('date') 
-                all_jadwal = kelola_database_jadwal("lihat")
-                hasil_filter = [m for m in all_jadwal if m.get('Date') == target_date]
-                
-                if not hasil_filter:
-                    balasan_final = f"📅 Tidak ada jadwal meeting pada **{format_tanggal_indo(target_date)}**."
-                else:
-                    balasan_final = f"📅 **Jadwal Meeting: {format_tanggal_indo(target_date)}**\n"
-                    for item in hasil_filter:
-                        balasan_final += f"\n🕒 {item.get('Time')} WIB"
-                        balasan_final += f"\n📝 {item.get('Topic')}"
-                        balasan_final += f"\n📍 {item.get('Location', '-')}"
-                        balasan_final += f"\n🔗 {item.get('Link', '-')}\n"
+    if not triggered:
+        return jsonify({"status": "ignored_text"})
 
-            elif action == 'search_file':
-                balasan_final = cari_file_di_drive(data_json.get('keyword'))
+    jawaban_ai = tanya_blackbox(message, group_id=sender, corr_id=message_id)
+    balasan_final = jawaban_ai
 
-            elif action == 'web_search':
-                keyword = data_json.get('keyword')
-                hasil_cari = cari_di_internet(keyword)
-                balasan_final = tanya_blackbox(f"User tanya: {message}", f"Fakta Internet: {hasil_cari}")
-
-            elif action == 'reset_schedule':
-                kelola_database_jadwal("reset")
-                balasan_final = "🗑️ Database Direset."
-
-        except Exception as e: print(f"Error Action: {e}")
+    try:
+        data_json = extract_first_json_object(jawaban_ai)
+        if data_json:
+            valid, reason = validate_action_payload(data_json, sender)
+            if valid:
+                balasan_final = execute_action(data_json, sender, message, corr_id=message_id)
+            else:
+                log.warning("Invalid action payload: %s", reason)
+    except Exception as exc:
+        log.exception("Error executing AI action: %s", exc)
 
     return jsonify({"reply": balasan_final})
 
+
+def bootstrap():
+    validate_required_env()
+    start_scheduler()
+
+
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    bootstrap()
+    app.run(port=5000, debug=FLASK_DEBUG)

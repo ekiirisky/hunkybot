@@ -3,7 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "health": "node -e \"fetch('http://127.0.0.1:3000/health').then(r=>r.text()).then(console.log).catch(e=>{console.error(e);process.exit(1);})\"",
+    "test": "echo \"No JS tests yet\""
   },
   "keywords": [],
   "author": "",
