@@ -4,6 +4,9 @@ const axios = require('axios');
 const fs = require('fs');
 const mime = require('mime-types');
 const path = require('path');
+const express = require('express'); 
+const app = express();              
+app.use(express.json());            
 
 // --- KONFIGURASI ---
 const phoneNumber = "628816883610"; // GANTI NOMOR KAMU
@@ -24,9 +27,8 @@ async function downloadAndSave(msgObject, type) {
     try {
         const buffer = await downloadMediaMessage(msgObject, 'buffer', {}, { logger: pino({ level: 'silent' }) });
         
-        let mimetype = type; // Default dari parameter
+        let mimetype = type; 
         
-        // Coba deteksi mime asli dari pesan
         if (msgObject.message?.imageMessage) mimetype = msgObject.message.imageMessage.mimetype;
         if (msgObject.message?.documentMessage) mimetype = msgObject.message.documentMessage.mimetype;
         if (msgObject.message?.videoMessage) mimetype = msgObject.message.videoMessage.mimetype;
@@ -38,8 +40,6 @@ async function downloadAndSave(msgObject, type) {
         const savePath = path.join(__dirname, '../temp_downloads', fileName);
         
         fs.writeFileSync(savePath, buffer);
-        console.log(`✅ Berhasil mengambil file: ${fileName}`);
-        
         return { path: savePath, mime: mimetype };
     } catch (err) {
         console.error("❌ Gagal download media:", err);
@@ -57,6 +57,24 @@ async function connectToWhatsApp() {
         browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
+    // --- SETUP SERVER PUSH (AGAR BISA DIPERINTAH PYTHON) ---
+    // Hapus route lama jika ada (biar tidak numpuk saat reconnect)
+    app._router?.stack?.pop(); 
+    
+    app.post('/send-message', async (req, res) => {
+        try {
+            const { target_id, message } = req.body;
+            console.log(`🔔 Menerima perintah reminder untuk: ${target_id}`);
+            
+            // Kirim pesan WA
+            await sock.sendMessage(target_id, { text: message });
+            res.send({ status: "sent" });
+        } catch (e) {
+            console.error("Gagal kirim reminder:", e);
+            res.status(500).send({ error: e.message });
+        }
+    });
+
     if (!sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
@@ -68,7 +86,7 @@ async function connectToWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', (update) => {
-        if (update.connection === 'open') console.log('✅ HUNKY SIAP (MODE REPLY AKTIF)!');
+        if (update.connection === 'open') console.log('✅ HUNKY SIAP (MODE REPLY & REMINDER AKTIF)!');
         if (update.connection === 'close') connectToWhatsApp();
     });
 
@@ -81,62 +99,47 @@ async function connectToWhatsApp() {
         const content = unwrapMessage(msg);
         if (!content) return;
 
-        // 1. Ambil Teks Pesan (Caption atau Chat biasa)
         let textMessage = 
             content.conversation || 
             content.extendedTextMessage?.text || 
             content.imageMessage?.caption || 
             content.documentMessage?.caption || "";
 
-        // 2. Deteksi Media di Pesan SEKARANG (Direct Upload)
-        const isImage = content.imageMessage;
-        const isDocument = content.documentMessage;
-        
-        // 3. Deteksi Media di Pesan REPLY (Quoted Message)
-        // Ini logika untuk mengambil file dari chat yang di-reply
         const contextInfo = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.documentMessage?.contextInfo;
         const quotedMsg = contextInfo?.quotedMessage;
         
-        let targetFile = null;
-
-        // SKENARIO A: User kirim file langsung
-        if (isImage || isDocument) {
-            console.log("📂 Menerima File Langsung...");
-            // Kita bungkus ulang supaya fungsi download mau nerima
-            let msgToDownload = { ...msg, message: content }; 
-            targetFile = await downloadAndSave(msgToDownload, isImage?.mimetype || isDocument?.mimetype);
-        }
-        
-        // SKENARIO B: User ME-REPLY sebuah file
-        else if (quotedMsg) {
-            const quotedImage = quotedMsg.imageMessage;
-            const quotedDoc = quotedMsg.documentMessage;
-
-            if (quotedImage || quotedDoc) {
-                console.log("Vi🔄 Mendeteksi REPLY ke sebuah File...");
-                
-                // Trik: Kita buat objek pesan palsu yang isinya pesan yang di-reply
-                // Supaya library Baileys bisa mendownloadnya
-                let fakeMsgObject = {
-                    key: {
-                        remoteJid: sender,
-                        id: contextInfo.stanzaId, // ID pesan yang lama
-                    },
-                    message: quotedMsg
-                };
-
-                targetFile = await downloadAndSave(fakeMsgObject, quotedImage?.mimetype || quotedDoc?.mimetype);
+        if (quotedMsg) {
+            const quotedText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || "";
+            if (quotedText) {
+                textMessage = `[User Request]: ${textMessage}\n\n[Data Reply/Forward]: "${quotedText}"`;
             }
         }
 
-        // Kirim ke Python
-        // Kalau targetFile ada isinya (baik dari langsung atau reply), kirim path-nya
+        const isImage = content.imageMessage;
+        const isDocument = content.documentMessage;
+        let targetFile = null;
+
+        if (isImage || isDocument) {
+            let msgToDownload = { ...msg, message: content }; 
+            targetFile = await downloadAndSave(msgToDownload, isImage?.mimetype || isDocument?.mimetype);
+        }
+        else if (quotedMsg && (quotedMsg.imageMessage || quotedMsg.documentMessage)) {
+            const qImg = quotedMsg.imageMessage;
+            const qDoc = quotedMsg.documentMessage;
+            
+            let fakeMsgObject = {
+                key: { remoteJid: sender, id: contextInfo.stanzaId },
+                message: quotedMsg
+            };
+            targetFile = await downloadAndSave(fakeMsgObject, qImg?.mimetype || qDoc?.mimetype);
+        }
+
         if (textMessage || targetFile) {
             try {
                 const response = await axios.post('http://127.0.0.1:5000/chat', {
                     sender: sender,
                     message: textMessage || "",
-                    file_path: targetFile ? targetFile.path : null, // Kirim path file
+                    file_path: targetFile ? targetFile.path : null,
                     mime_type: targetFile ? targetFile.mime : null
                 });
 
@@ -149,5 +152,10 @@ async function connectToWhatsApp() {
         }
     });
 }
+
+// --- WAJIB: JALANKAN SERVER PORT 3000 ---
+app.listen(3000, () => {
+    console.log('🚀 Server WA (Express) siap di port 3000');
+});
 
 connectToWhatsApp();

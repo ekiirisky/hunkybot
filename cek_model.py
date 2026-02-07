@@ -1,22 +1,40 @@
-from google import genai
+import requests
 import os
+from dotenv import load_dotenv
 
-# --- GANTI API KEY ---
-GEMINI_API_KEY = "AIzaSyBQgKMz6ZyWnYyN0xjEdWRefbpNsuRir4Q" 
+load_dotenv()
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+def cek_daftar_model():
+    # Endpoint untuk melihat daftar model
+    # Kita coba beberapa variasi URL karena dokumentasi kadang berubah
+    urls_to_try = [
+        "https://api.blackbox.ai/api/models",
+        "https://api.blackbox.ai/v1/models"
+    ]
+    
+    api_key = os.getenv("BLACKBOX_API_KEY")
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
 
-print("🔍 Sedang mencari model...")
-print("-" * 30)
+    print("🔍 Sedang mengecek daftar model...")
 
-try:
-    # Ambil semua model dan print namanya saja
-    for m in client.models.list():
-        # Kita print nama modelnya langsung
-        print(f"✅ {m.name}")
+    for url in urls_to_try:
+        try:
+            print(f"👉 Mencoba URL: {url}")
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                print("✅ BERHASIL! Daftar Model ditemukan:")
+                data = response.json()
+                print(data)
+                return # Berhenti jika sudah ketemu
+            else:
+                print(f"❌ Gagal di URL ini ({response.status_code})")
+        except Exception as e:
+            print(f"Error: {e}")
 
-    print("-" * 30)
-    print("Pilihlah salah satu yang ada tulisan 'gemini' dan 'flash'.")
-
-except Exception as e:
-    print(f"❌ Error: {e}")
+if __name__ == "__main__":
+    cek_daftar_model()
