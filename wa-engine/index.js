@@ -21,6 +21,29 @@ const PYTHON_TIMEOUT_MS = Number(process.env.PYTHON_TIMEOUT_MS || 25000);
 let currentSocket = null;
 let isWaConnected = false;
 
+function normalizeJid(jid) {
+    return String(jid || '').split(':')[0];
+}
+
+function isBotMentioned(content, contextInfo, botJid) {
+    const mentioned = contextInfo?.mentionedJid || [];
+    const normalizedBot = normalizeJid(botJid);
+    if (mentioned.some((jid) => normalizeJid(jid) === normalizedBot)) return true;
+
+    const text =
+        content?.conversation ||
+        content?.extendedTextMessage?.text ||
+        content?.imageMessage?.caption ||
+        content?.documentMessage?.caption ||
+        '';
+    const lowered = String(text).toLowerCase();
+    if (!lowered) return false;
+
+    // Fallback trigger jika mention metadata tidak tersedia.
+    const botPhone = normalizedBot.replace('@s.whatsapp.net', '');
+    return lowered.includes('@hunky') || lowered.includes(`@${botPhone}`);
+}
+
 function unwrapMessage(msg) {
     if (!msg.message) return null;
     let content = msg.message;
@@ -143,6 +166,7 @@ async function connectToWhatsApp() {
             content.documentMessage?.contextInfo;
 
         const quotedMsg = contextInfo?.quotedMessage;
+        const botHit = isBotMentioned(content, contextInfo, sock.user?.id);
 
         if (quotedMsg) {
             const quotedText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || '';
@@ -154,10 +178,12 @@ async function connectToWhatsApp() {
         const isImage = content.imageMessage;
         const isDocument = content.documentMessage;
         let targetFile = null;
+        let fileSource = null;
 
         if (isImage || isDocument) {
             const msgToDownload = { ...msg, message: content };
             targetFile = await downloadAndSave(msgToDownload, isImage?.mimetype || isDocument?.mimetype);
+            fileSource = targetFile ? 'direct' : null;
         } else if (quotedMsg && (quotedMsg.imageMessage || quotedMsg.documentMessage)) {
             const qImg = quotedMsg.imageMessage;
             const qDoc = quotedMsg.documentMessage;
@@ -166,6 +192,7 @@ async function connectToWhatsApp() {
                 message: quotedMsg,
             };
             targetFile = await downloadAndSave(fakeMsgObject, qImg?.mimetype || qDoc?.mimetype);
+            fileSource = targetFile ? 'quoted' : null;
         }
 
         if (!textMessage && !targetFile) return;
@@ -178,6 +205,8 @@ async function connectToWhatsApp() {
                     message: textMessage || '',
                     file_path: targetFile ? targetFile.path : null,
                     mime_type: targetFile ? targetFile.mime : null,
+                    file_source: fileSource,
+                    bot_hit: botHit,
                     message_id: messageId,
                 },
                 { timeout: PYTHON_TIMEOUT_MS },
