@@ -416,3 +416,34 @@ def test_chat_ambiguous_lookup_returns_clarification(tmp_path, monkeypatch):
 
     assert resp.status_code == 200
     assert "Google Drive atau internet" in resp.get_json()["reply"]
+
+
+def test_chat_general_question_rewrites_no_data_template_reply(tmp_path, monkeypatch):
+    setup_repo(tmp_path, monkeypatch)
+    calls = {"count": 0}
+
+    def fake_ai(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return (
+                "Berdasarkan informasi yang tersedia, belum ada data terbaru tentang cara menjadi produktif "
+                "yang dapat saya sampaikan."
+            )
+        return "Agar produktif: tetapkan 3 prioritas harian, blok waktu fokus 60-90 menit, dan evaluasi progres tiap malam."
+
+    monkeypatch.setattr(app, "tanya_blackbox", fake_ai)
+    client = app.app.test_client()
+
+    resp = client.post(
+        "/chat",
+        json={
+            "sender": "628123456789@s.whatsapp.net",
+            "message": "bagaimana cara agar kita produktif?",
+            "file_path": None,
+            "mime_type": None,
+            "message_id": "m-16",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert "tetapkan 3 prioritas harian" in resp.get_json()["reply"]

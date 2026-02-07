@@ -747,6 +747,37 @@ def rewrite_as_plain_text(user_message, raw_ai_output, sender, corr_id="-"):
     return tanya_blackbox(prompt, group_id=sender, konteks_tambahan="Mode teks-only tanpa JSON.", corr_id=corr_id)
 
 
+def should_rewrite_general_chat_reply(reply_text):
+    lowered = str(reply_text or "").lower()
+    bad_patterns = [
+        "belum ada data terbaru",
+        "belum ada informasi terbaru",
+        "tidak dapat saya sampaikan",
+        "tidak memiliki data",
+        "disarankan mencari sumber resmi",
+        "silakan mencari sumber resmi",
+    ]
+    return any(pattern in lowered for pattern in bad_patterns)
+
+
+def rewrite_as_general_assistant_answer(user_message, raw_ai_output, sender, corr_id="-"):
+    prompt = (
+        "Jawab pertanyaan user sebagai asisten AI umum.\n"
+        "- Gunakan pengetahuan umum yang kamu miliki.\n"
+        "- Jangan bilang tidak ada data terbaru jika pertanyaannya bersifat umum/non-berita.\n"
+        "- Berikan jawaban praktis, jelas, dan langsung.\n"
+        "- Jangan output JSON.\n\n"
+        f"Pertanyaan user: {user_message}\n"
+        f"Jawaban sebelumnya yang kurang tepat: {raw_ai_output}"
+    )
+    return tanya_blackbox(
+        prompt,
+        group_id=sender,
+        konteks_tambahan="Mode asisten umum non-aksi.",
+        corr_id=corr_id,
+    )
+
+
 def validate_action_payload(data_json, sender):
     if not isinstance(data_json, dict):
         return False, "Payload aksi harus object JSON."
@@ -1079,6 +1110,10 @@ def chat():
         if any(phrase in lowered_reply for phrase in no_access_phrases):
             keyword_drive = extract_drive_lookup_keyword(message)
             balasan_final = cari_file_di_drive(keyword_drive, corr_id=message_id)
+
+    if routed.get("intent") == "chat" and should_rewrite_general_chat_reply(balasan_final):
+        rewritten = rewrite_as_general_assistant_answer(message, balasan_final, sender, corr_id=message_id)
+        balasan_final = normalize_text_reply_if_json(rewritten)
 
     return jsonify({"reply": balasan_final})
 
