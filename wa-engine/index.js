@@ -9,39 +9,58 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+// Logger kita buat lebih detail
+const logger = pino({ 
+    level: process.env.LOG_LEVEL || 'info',
+    transport: {
+        target: 'pino-pretty',
+        options: { colorize: true }
+    }
+});
 
 // --- KONFIGURASI ---
 const phoneNumber = process.env.WA_PHONE_NUMBER || '628816883610';
 const PYTHON_CHAT_URL = process.env.PYTHON_CHAT_URL || 'http://127.0.0.1:5000/chat';
 const WA_AUTH_DIR = process.env.WA_AUTH_DIR || 'auth_session';
 const WA_PORT = Number(process.env.WA_PORT || 3000);
-const PYTHON_TIMEOUT_MS = Number(process.env.PYTHON_TIMEOUT_MS || 25000);
+const PYTHON_TIMEOUT_MS = Number(process.env.PYTHON_TIMEOUT_MS || 60000); // Naikkan timeout biar aman
 
 let currentSocket = null;
 let isWaConnected = false;
+
+// Pastikan folder temp ada
+const tempDir = path.join(__dirname, '../temp_downloads');
+if (!fs.existsSync(tempDir)){
+    fs.mkdirSync(tempDir, { recursive: true });
+}
 
 function normalizeJid(jid) {
     return String(jid || '').split(':')[0];
 }
 
 function isBotMentioned(content, contextInfo, botJid) {
+    // 1. Cek Metadata Mention (Tulisan Biru)
     const mentioned = contextInfo?.mentionedJid || [];
-    const normalizedBot = normalizeJid(botJid);
-    if (mentioned.some((jid) => normalizeJid(jid) === normalizedBot)) return true;
+    // Gunakan phoneNumber config sebagai fallback jika socket user ID belum siap
+    const targetJid = normalizeJid(botJid || (phoneNumber + '@s.whatsapp.net')); 
+    
+    if (mentioned.some((jid) => normalizeJid(jid) === targetJid)) return true;
 
+    // 2. Cek Manual di Text/Caption
     const text =
         content?.conversation ||
         content?.extendedTextMessage?.text ||
         content?.imageMessage?.caption ||
         content?.documentMessage?.caption ||
         '';
+    
     const lowered = String(text).toLowerCase();
     if (!lowered) return false;
 
-    // Fallback trigger jika mention metadata tidak tersedia.
-    const botPhone = normalizedBot.replace('@s.whatsapp.net', '');
-    return lowered.includes('@hunky') || lowered.includes(`@${botPhone}`);
+    const botPhone = targetJid.replace('@s.whatsapp.net', '');
+    
+    // Trigger Kata Kunci: @hunky, @nomorbot, atau kata "bot"
+    return lowered.includes('@hunky') || lowered.includes(`@${botPhone}`) || lowered === 'bot';
 }
 
 function unwrapMessage(msg) {
@@ -56,23 +75,27 @@ function unwrapMessage(msg) {
 
 async function downloadAndSave(msgObject, type) {
     try {
+        logger.info('📥 Sedang mendownload media...');
         const buffer = await downloadMediaMessage(msgObject, 'buffer', {}, { logger: pino({ level: 'silent' }) });
 
         let mimetype = type;
-        if (msgObject.message?.imageMessage) mimetype = msgObject.message.imageMessage.mimetype;
-        if (msgObject.message?.documentMessage) mimetype = msgObject.message.documentMessage.mimetype;
-        if (msgObject.message?.videoMessage) mimetype = msgObject.message.videoMessage.mimetype;
+        // Pastikan mimetype diambil dari object yang benar
+        const msg = unwrapMessage(msgObject);
+        if (msg?.imageMessage) mimetype = msg.imageMessage.mimetype;
+        if (msg?.documentMessage) mimetype = msg.documentMessage.mimetype;
+        if (msg?.videoMessage) mimetype = msg.videoMessage.mimetype;
 
         let extension = mime.extension(mimetype);
         if (!extension) extension = 'bin';
 
-        const fileName = `reply_file_${Date.now()}.${extension}`;
-        const savePath = path.join(__dirname, '../temp_downloads', fileName);
+        const fileName = `file_${Date.now()}.${extension}`;
+        const savePath = path.join(tempDir, fileName);
 
         fs.writeFileSync(savePath, buffer);
+        logger.info({ path: savePath }, '✅ Media tersimpan di VPS');
         return { path: savePath, mime: mimetype };
     } catch (err) {
-        logger.error({ err }, 'Gagal download media');
+        logger.error({ err }, '❌ Gagal download media');
         return null;
     }
 }
@@ -81,7 +104,6 @@ app.get('/health', (_req, res) => {
     return res.status(isWaConnected ? 200 : 503).json({
         status: isWaConnected ? 'ok' : 'degraded',
         wa_connection: isWaConnected ? 'open' : 'closed',
-        python_chat_url: PYTHON_CHAT_URL,
     });
 });
 
@@ -91,15 +113,13 @@ app.post('/send-message', async (req, res) => {
         if (!targetId || !message) {
             return res.status(400).send({ error: 'target_id dan message wajib diisi' });
         }
-
         if (!currentSocket || !isWaConnected) {
             return res.status(503).send({ error: 'WA socket belum siap' });
         }
-
         await currentSocket.sendMessage(targetId, { text: message });
         return res.send({ status: 'sent' });
     } catch (e) {
-        logger.error({ err: e }, 'Gagal kirim reminder');
+        logger.error({ err: e }, 'Gagal kirim pesan');
         return res.status(500).send({ error: e.message });
     }
 });
@@ -111,7 +131,8 @@ async function connectToWhatsApp() {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        browser: ['HunkyBot', 'Chrome', '1.0.0'],
+        markOnlineOnConnect: true
     });
 
     currentSocket = sock;
@@ -120,7 +141,7 @@ async function connectToWhatsApp() {
         setTimeout(async () => {
             try {
                 const code = await sock.requestPairingCode(phoneNumber);
-                logger.info({ code }, 'CODE LOGIN');
+                console.log(`\n\n⚠️  KODE PAIRING: ${code}  ⚠️\n\n`);
             } catch (err) {
                 logger.error({ err }, 'Gagal request pairing code');
             }
@@ -130,15 +151,16 @@ async function connectToWhatsApp() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
-        if (update.connection === 'open') {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'open') {
             isWaConnected = true;
-            logger.info('HUNKY SIAP (MODE REPLY & REMINDER AKTIF)');
+            logger.info('🟢 HUNKY SIAP (Koneksi Stabil)');
         }
-
-        if (update.connection === 'close') {
+        if (connection === 'close') {
             isWaConnected = false;
-            logger.warn('Koneksi WA tertutup, mencoba reconnect ulang');
-            connectToWhatsApp().catch((err) => logger.error({ err }, 'Reconnect gagal'));
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+            logger.warn('🔴 Koneksi WA putus, reconnecting...');
+            if(shouldReconnect) connectToWhatsApp();
         }
     });
 
@@ -153,6 +175,7 @@ async function connectToWhatsApp() {
         const content = unwrapMessage(msg);
         if (!content) return;
 
+        // Ekstrak Text (Caption atau Pesan Biasa)
         let textMessage =
             content.conversation ||
             content.extendedTextMessage?.text ||
@@ -166,8 +189,12 @@ async function connectToWhatsApp() {
             content.documentMessage?.contextInfo;
 
         const quotedMsg = contextInfo?.quotedMessage;
-        const botHit = isBotMentioned(content, contextInfo, sock.user?.id);
+        
+        // FIX: Gunakan user ID dari socket atau fallback ke config phoneNumber
+        const myJid = sock.user?.id || (phoneNumber + '@s.whatsapp.net');
+        const botHit = isBotMentioned(content, contextInfo, myJid);
 
+        // Logic Quoted (Reply)
         if (quotedMsg) {
             const quotedText = quotedMsg.conversation || quotedMsg.extendedTextMessage?.text || '';
             if (quotedText) {
@@ -180,13 +207,17 @@ async function connectToWhatsApp() {
         let targetFile = null;
         let fileSource = null;
 
+        // Logic Download File
         if (isImage || isDocument) {
+            // Kita download file-nya dulu biar siap dikirim ke Python
             const msgToDownload = { ...msg, message: content };
             targetFile = await downloadAndSave(msgToDownload, isImage?.mimetype || isDocument?.mimetype);
             fileSource = targetFile ? 'direct' : null;
         } else if (quotedMsg && (quotedMsg.imageMessage || quotedMsg.documentMessage)) {
+            // Handle jika user reply gambar dengan perintah "simpan"
             const qImg = quotedMsg.imageMessage;
             const qDoc = quotedMsg.documentMessage;
+            // Hack: Bikin fake message object buat didownload baileys
             const fakeMsgObject = {
                 key: { remoteJid: sender, id: contextInfo?.stanzaId },
                 message: quotedMsg,
@@ -197,6 +228,14 @@ async function connectToWhatsApp() {
 
         if (!textMessage && !targetFile) return;
 
+        // DEBUG: Lihat apa yang mau dikirim ke Python
+        logger.info({ 
+            msg: "🚀 MENGIRIM KE PYTHON...", 
+            text: textMessage, 
+            hasFile: !!targetFile, 
+            botHit: botHit 
+        });
+
         try {
             const response = await axios.post(
                 PYTHON_CHAT_URL,
@@ -206,32 +245,34 @@ async function connectToWhatsApp() {
                     file_path: targetFile ? targetFile.path : null,
                     mime_type: targetFile ? targetFile.mime : null,
                     file_source: fileSource,
-                    bot_hit: botHit,
+                    bot_hit: botHit, // Ini kunci agar Python memproses di grup
                     message_id: messageId,
                 },
                 { timeout: PYTHON_TIMEOUT_MS },
             );
 
+            // Jika Python membalas ada reply, kirim ke WA
             if (response.data?.reply) {
                 await sock.sendMessage(sender, { text: response.data.reply });
+                logger.info("✅ Balasan terkirim ke WA");
+            } else if (response.data?.status === 'ignored_file') {
+                logger.warn("⚠️ Python mengabaikan file (Trigger/Keyword tidak cocok)");
             }
+
         } catch (error) {
             logger.error(
                 {
-                    err: error,
-                    sender,
-                    messageId,
-                    status: error.response?.status,
-                    data: error.response?.data,
+                    err: error.message,
+                    data: error.response?.data
                 },
-                'Gagal forward pesan ke Python API',
+                '❌ Gagal komunikasi dengan Python API'
             );
         }
     });
 }
 
 app.listen(WA_PORT, () => {
-    logger.info({ port: WA_PORT }, 'Server WA (Express) siap');
+    logger.info(`Server WA berjalan di port ${WA_PORT}`);
 });
 
-connectToWhatsApp().catch((err) => logger.error({ err }, 'Initial connect gagal'));
+connectToWhatsApp().catch((err) => logger.error({ err }, 'Fatal Error Connect'));
