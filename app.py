@@ -35,13 +35,6 @@ BOT_TRIGGERS = [
     "ai",
     "@628816883610",
     "@262779135115377",
-    "tolong",
-    "catat",
-    "cari",
-    "simpan",
-    "ingatkan",
-    "jadwal",
-    "meeting",
 ]
 
 SCOPES = [
