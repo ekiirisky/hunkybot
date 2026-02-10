@@ -1028,7 +1028,7 @@ def chat():
 
         if is_group:
             # Di grup, file hanya diproses jika bot di-hit/mention.
-            should_upload = bot_hit
+            should_upload = bot_hit or (triggered and keyword_simpan)
         else:
             should_upload = triggered and keyword_simpan
 
